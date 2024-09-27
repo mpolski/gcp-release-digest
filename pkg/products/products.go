@@ -8,7 +8,6 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// ## NEW STUFF
 func GetProductsbyReleaseType(ctx context.Context, projectID string, releaseNotebyType string, cadence string) ([]Product, error) {
 	client, err := bigquery.NewClient(ctx, projectID)
 	if err != nil {

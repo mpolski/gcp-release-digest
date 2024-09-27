@@ -10,15 +10,6 @@ import (
 )
 
 // Summarize uses a Vertex AI Generative Model to summarize a list of release notes for a given product.
-//
-// It takes the following parameters:
-// - ctx: A context for the request.
-// - projectID: The Google Cloud project ID.
-// - vertexModel: The name of the Vertex AI Generative Model to use for summarization.
-// - location: The location of the Vertex AI Generative Model.
-// - product: The name of the product for which the release notes are being summarized.
-// - releaseNotesSlice: A slice of strings containing the release notes to be summarized.
-//
 // The function returns a string containing the summarized text, or an error if any occurs during the process.
 func Summarize(ctx context.Context, projectID string, vertexModel string, location string, product string, releaseNotesSlice []string) (string, error) {
 
