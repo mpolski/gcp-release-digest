@@ -44,7 +44,7 @@ NOTE: if Cadence is set to 3, release notes will be from the last 3 days however
 2. Read the environment variables
 
 ```
-source .evn.vars
+source evn.vars
 ```
 
 3. Run the function
@@ -72,7 +72,7 @@ FUNCTION=
 2. Deploy the function and verify:
 
 ```
-gcloud functions deploy $FUNCTION --runtime go122 --trigger-http --entry-point digest --env-vars-file .env.yaml --region $REGION --no-allow-unauthenticated
+gcloud functions deploy $FUNCTION --runtime go122 --trigger-http --entry-point digest --env-vars-file env.yaml --region $REGION --no-allow-unauthenticated
 
 gcloud functions list
 ```
