@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/mpolski/gcp-release-digest/pkg/notify"
@@ -18,6 +19,15 @@ import (
 func init() {
 	functions.HTTP("digest", digest)
 }
+
+var cadence string
+var cadenceInt int
+
+// Create a slice for added Channels
+var activeChannels []Channel
+
+// Create a slice for missed Channels
+var noActiveChannel []string
 
 // digest is the main function that handles the HTTP request for the digest service.
 // It retrieves a list of products with new release notes, summarizes the release notes for each product,
@@ -91,15 +101,6 @@ func digest(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Error: At least one channel environment variable needs to be provided (either GENERAL or any of the specific channels).")
 		return
 	}
-	// Create a struct for Release Note Type mappped to a Webhook URI
-	type Channel struct {
-		ReleasetNoteType string
-		WebhookURL       string
-	}
-	// Create a slice for added Channels
-	var activeChannels []Channel
-	// Create a slice for missed Channels
-	var noActiveChannel []string
 
 	// Populate the slice with non-empty channels, except of GENERAL
 	channelNames := []string{"BREAKING_CHANGE", "DEPRECATION", "FEATURE", "FIX", "ISSUE", "LIBRARIES", "NON_BREAKING_CHANGE", "SECURITY_BULLETIN", "SERVICE_ANNOUNCEMENT"}
@@ -122,120 +123,116 @@ func digest(w http.ResponseWriter, r *http.Request) {
 	// Print the list of products with release notes.
 	fmt.Printf("Querying for products with release notes for the last %d days...\n\n", cadenceInt)
 
-	// For each active channel, find release not types descriptions
+	// --- Concurrency Implementation Starts Here ---
+
+	// Create a WaitGroup to manage goroutines.
+	var wg sync.WaitGroup
+
+	// Process each active channel concurrently.
 	for _, c := range activeChannels {
+		wg.Add(1) // Increment WaitGroup counter for each channel.
 
-		queryProductsbyReleaseType, err := products.GetProductsbyReleaseType(ctx, projectID, c.ReleasetNoteType, cadence)
-		if err != nil {
-			log.Fatalf("Error querying for release notes by type: %v", err)
-		}
+		go func(channel Channel) { // Use a closure to avoid data race.
+			defer wg.Done() // Decrement WaitGroup counter when done.
 
-		// Announce the list and count of products with release notes to the webhook.
-		notify.Announce(ctx, c.WebhookURL, cadenceInt, queryProductsbyReleaseType)
-		if err != nil {
-			log.Fatalf("Error sending to Webhook: %v", err)
-		}
-
-		for _, t := range queryProductsbyReleaseType {
-			queryReleaseNotesbyType, err := releasenotes.GetReleaseNotesbyType(ctx, projectID, t.Product, c.ReleasetNoteType, cadence)
-			if err != nil {
-				log.Fatalf("Error querying for release notes by type: %v", err)
-			}
-
-			// Create a slice of strings to hold the release notes.
-			var releaseNotesSlice []string
-			for _, r := range queryReleaseNotesbyType {
-				releaseNotesSlice = append(releaseNotesSlice, r.ReleaseNoteType, r.Description)
-			}
-
-			// Summarize the release notes using the Vertex AI Generative Model.
-			fmt.Printf("Asking for summary with model %s\n", model)
-			summaryResult, err := summarize.Summarize(ctx, projectID, model, modelLocation, t.Product, releaseNotesSlice)
-			if err != nil {
-				log.Fatalf("Error summarizing: %v", err)
-			}
-
-			// Send the summary of release notes to the webhook.
-			fmt.Print("Sending summary via webhook...")
-			sendToWebhook, err := notify.SendToWebhook(ctx, t.Product, summaryResult, c.WebhookURL)
-			if err != nil {
-				log.Fatalf("Error sending via webhook: %v", err)
-			}
-			fmt.Printf(" %s\n", sendToWebhook)
-		}
-		// Send a closing message to the webhook.
-
-		if len(queryProductsbyReleaseType) > 0 {
-			fmt.Print("Closing message...")
-			anyMsg := "That's all folks!"
-			closeMessage, err := notify.ClosingMessage(ctx, c.WebhookURL, anyMsg)
-			if err != nil {
-				log.Fatalf("Error closing message: %v", err)
-			}
-			fmt.Printf(" %s\n\n", closeMessage)
-		}
+			processChannel(ctx, projectID, cadence, channel, model, modelLocation)
+		}(c)
 	}
 
-	// Print noActiveChannels
+	wg.Wait() // Wait for all goroutines to finish.
+
+	// --- Concurrency for GENERAL channel (if applicable) ---
+
 	if chGeneral != "" {
-		fmt.Println("Since GENERAL channel is set, release note types not send to specific channels will be sent to GENERAL channel:")
-		for _, v := range noActiveChannel {
-			fmt.Printf(" - %s\n", v)
-		}
-		fmt.Printf("GENERAL channel: %s\n", chGeneral)
+		wg.Add(1)
 
-		fmt.Println("--------------------------------------------------")
+		go func() {
+			defer wg.Done()
 
-		fmt.Printf("Querying for remainng relese notes the last %d days...\n\n", cadenceInt)
+			processChannel(ctx, projectID, cadence, Channel{ReleasetNoteType: "GENERAL", WebhookURL: chGeneral}, model, modelLocation)
+		}()
 
-		queryPrducts, err := products.GetProducts(ctx, projectID, noActiveChannel, cadence)
-		if err != nil {
-			log.Fatalf("Error querying for release notes by type: %v", err)
-		}
-
-		// Announce the list and count of products with release notes to the webhook.
-		notify.Announce(ctx, chGeneral, cadenceInt, queryPrducts)
-		if err != nil {
-			log.Fatalf("Error sending to Webhook: %v", err)
-		}
-
-		for _, t := range queryPrducts {
-			queryReleaseNotes, err := releasenotes.GetReleaseNotes(ctx, projectID, t.Product, noActiveChannel, cadence)
-			if err != nil {
-				log.Fatalf("Error querying for release notes by type: %v", err)
-			}
-
-			// Create a slice of strings to hold the release notes.
-			var releaseNotesSlice []string
-			for _, r := range queryReleaseNotes {
-				releaseNotesSlice = append(releaseNotesSlice, r.ReleaseNoteType, r.Description)
-			}
-
-			// Summarize the release notes using the Vertex AI Generative Model.
-			fmt.Printf("Asking for summary with model %s\n", model)
-			summaryResult, err := summarize.Summarize(ctx, projectID, model, modelLocation, t.Product, releaseNotesSlice)
-			if err != nil {
-				log.Fatalf("Error summarizing: %v", err)
-			}
-
-			// Send the summary of release notes to the webhook.
-			fmt.Print("Sending summary via webhook...")
-			sendToWebhook, err := notify.SendToWebhook(ctx, t.Product, summaryResult, chGeneral)
-			if err != nil {
-				log.Fatalf("Error sending via webhook: %v", err)
-			}
-			fmt.Printf(" %s\n\n", sendToWebhook)
-		}
-		// Send a closing message to the webhook.
-
-		if len(queryPrducts) > 0 {
-			fmt.Print("Closing message...")
-			anyMsg := "That's all folks!"
-			closeMessage, err := notify.ClosingMessage(ctx, chGeneral, anyMsg)
-			if err != nil {
-				log.Fatalf("Error closing message: %v", err)
-			}
-			fmt.Printf(" %s\n\n", closeMessage)
-		}
+		wg.Wait()
 	}
+}
+
+// processChannel handles the processing for a specific channel.
+func processChannel(ctx context.Context, projectID, cadence string, c Channel, model, modelLocation string) {
+	var queryProducts []products.Product
+	var err error
+
+	if c.ReleasetNoteType == "GENERAL" {
+		queryProducts, err = products.GetProducts(ctx, projectID, noActiveChannel, cadence)
+	} else {
+		queryProducts, err = products.GetProductsbyReleaseType(ctx, projectID, c.ReleasetNoteType, cadence)
+	}
+
+	if err != nil {
+		log.Fatalf("Error querying for products: %v", err)
+		return // Handle the error appropriately (log, return, etc.)
+	}
+
+	// Announce products (no change needed here).
+	notify.Announce(ctx, c.WebhookURL, cadenceInt, queryProducts)
+
+	// Process each product within the channel concurrently.
+	var productWg sync.WaitGroup
+	for _, t := range queryProducts {
+		productWg.Add(1)
+		go func(product products.Product) {
+			defer productWg.Done()
+
+			processProduct(ctx, projectID, cadence, c, product, model, modelLocation)
+		}(t)
+	}
+	productWg.Wait()
+
+	// Send closing message (no change needed here).
+	if len(queryProducts) > 0 {
+		notify.ClosingMessage(ctx, c.WebhookURL, "That's all folks!")
+	}
+}
+
+// processProduct handles the processing for a specific product.
+func processProduct(ctx context.Context, projectID, cadence string, c Channel, t products.Product, model, modelLocation string) {
+	var queryReleaseNotes []releasenotes.ReleaseNote
+	var err error
+
+	if c.ReleasetNoteType == "GENERAL" {
+		queryReleaseNotes, err = releasenotes.GetReleaseNotes(ctx, projectID, t.Product, noActiveChannel, cadence)
+	} else {
+		queryReleaseNotes, err = releasenotes.GetReleaseNotesbyType(ctx, projectID, t.Product, c.ReleasetNoteType, cadence)
+	}
+
+	if err != nil {
+		log.Fatalf("Error querying for release notes: %v", err)
+		return
+	}
+
+	// Create a slice of strings to hold the release notes.
+	var releaseNotesSlice []string
+	for _, r := range queryReleaseNotes {
+		releaseNotesSlice = append(releaseNotesSlice, r.ReleaseNoteType, r.Description)
+	}
+
+	// Summarize the release notes using the Vertex AI Generative Model.
+	fmt.Printf("Asking for summary with model %s\n", model)
+	summaryResult, err := summarize.Summarize(ctx, projectID, model, modelLocation, t.Product, releaseNotesSlice)
+	if err != nil {
+		log.Fatalf("Error summarizing: %v", err)
+	}
+
+	// Send the summary of release notes to the webhook.
+	fmt.Print("Sending summary via webhook...")
+	sendToWebhook, err := notify.SendToWebhook(ctx, t.Product, summaryResult, c.WebhookURL)
+	if err != nil {
+		log.Fatalf("Error sending via webhook: %v", err)
+	}
+	fmt.Printf(" %s\n", sendToWebhook)
+}
+
+// Create a struct for Release Note Type mappped to a Webhook URI
+type Channel struct {
+	ReleasetNoteType string
+	WebhookURL       string
 }
