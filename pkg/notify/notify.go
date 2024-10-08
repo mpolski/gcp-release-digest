@@ -5,10 +5,46 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/mpolski/gcp-release-digest/pkg/products"
 )
+
+// Introduce rate limiting for Google Chat Space (limit is to 60 writes per minute to a chat space)
+func newRateLimiter(limit int, duration time.Duration) *rateLimiter {
+	rl := &rateLimiter{
+		limit:     limit,
+		duration:  duration,
+		tokens:    make(chan struct{}, limit),
+		lastReset: time.Now(),
+	}
+	rl.reset()
+	return rl
+}
+
+func (rl *rateLimiter) reset() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	close(rl.tokens)
+	rl.tokens = make(chan struct{}, rl.limit)
+	for i := 0; i < rl.limit; i++ {
+		rl.tokens <- struct{}{}
+	}
+	rl.lastReset = time.Now()
+}
+
+func (rl *rateLimiter) acquire() {
+	now := time.Now()
+	if now.Sub(rl.lastReset) >= rl.duration {
+		rl.reset()
+	}
+	<-rl.tokens
+}
+
+// Set to 45 messages per minute to allow for others
+var webhookRateLimiter = newRateLimiter(50, time.Minute)
 
 // Announce sends a notification message to the webhook URL, announcing the
 // products with new release notes published within the specified cadence.
@@ -46,6 +82,7 @@ func Announce(ctx context.Context, webhookURL string, cadenceInt int, products [
 // webhook URL.
 // It formats a message containing the product name and the summary result.
 func SendToWebhook(ctx context.Context, product, summaryResult, webhookURL string) (status string, err error) {
+	webhookRateLimiter.acquire() // Acquire a token or wait until one is available
 
 	// Format the message string for sending to the webhook.
 	msgStr := fmt.Sprintf(`{"text": "*%s:*\n\n%s`+"\n\n"+`"}`, product, summaryResult)
@@ -93,4 +130,12 @@ func SendMessage(ctx context.Context, webhookURL, msgStr string) (status string,
 
 	// Return the status code of the response.
 	return resp.Status, nil
+}
+
+type rateLimiter struct {
+	limit     int
+	duration  time.Duration
+	tokens    chan struct{}
+	lastReset time.Time
+	mu        sync.Mutex
 }
